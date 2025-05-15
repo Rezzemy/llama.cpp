@@ -943,9 +943,12 @@ extern "C" {
     // Requires KV cache.
     // For encode-decoder contexts, processes the batch using the decoder.
     // Positive return values does not mean a fatal error, but rather a warning.
-    //   0 - success
-    //   1 - could not find a KV slot for the batch (try reducing the size of the batch or increase the context)
-    // < 0 - error. the KV cache state is restored to the state before this call
+    //    0 - success
+    //    1 - could not find a KV slot for the batch (try reducing the size of the batch or increase the context)
+    //         the KV cache is restored to the state before this call
+    //    2 - aborted. the KV cache is in undefined state
+    //   -1 - invalid input batch. the KV cache is unmodified
+    // < -1 - error. the KV cache is in undefined state
     LLAMA_API int32_t llama_decode(
             struct llama_context * ctx,
               struct llama_batch   batch);
