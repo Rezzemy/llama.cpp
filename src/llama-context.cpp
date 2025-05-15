@@ -871,8 +871,6 @@ int llama_context::decode(llama_batch & inp_batch) {
     const int64_t n_tokens_all = batch.n_tokens;
     const int64_t n_embd       = hparams.n_embd;
 
-    llama_kv_cache_guard kv_guard(kv_self);
-
     GGML_ASSERT((!batch.token && batch.embd) || (batch.token && !batch.embd)); // NOLINT
 
     if (batch.token) {
@@ -912,8 +910,6 @@ int llama_context::decode(llama_batch & inp_batch) {
         n_outputs_all = 1;
     }
 
-    llama_sbatch sbatch = kv_self->sbatch_init(batch, /* logits_all */ n_outputs_all == n_tokens_all);
-
     // reserve output buffer
     if (output_reserve(n_outputs_all) < n_outputs_all) {
         LLAMA_LOG_ERROR("%s: could not reserve space for batch with %" PRId64 " outputs\n", __func__, n_outputs_all);
@@ -923,11 +919,59 @@ int llama_context::decode(llama_batch & inp_batch) {
     // handle any pending defrags/shifts
     kv_self_update();
 
+    llama_kv_cache_guard kv_guard(kv_self);
+
+    // this is the sequence-aware batch that we construct based on the input batch
+    llama_sbatch sbatch;
+
+    // we then split the sbatch into a set of ubatches. the split logic is delegated to the KV cache
+    std::vector<llama_ubatch> ubatches;
+
+    // if we fail to find a slot for the batch, we can retry after applying a defrag.
+    //   in some cases, this can free up some space, which would be enough to fit the ubatches
+    // ref: https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2881412612
+    bool retry = true;
+
+    while (true) {
+        bool success = true;
+
+        sbatch = kv_self->sbatch_init(batch, /* logits_all */ n_outputs_all == n_tokens_all);
+
+        while (sbatch.n_tokens > 0) {
+            ubatches.emplace_back(kv_self->ubatch_next(sbatch, cparams.n_ubatch, embd_pooled));
+
+            // find an empty KV slot that can fit the current ubatch
+            if (!kv_self->find_slot(ubatches.back())) {
+                success = false;
+                break;
+            }
+        }
+
+        if (success) {
+            break;
+        }
+
+        if (!retry) {
+            LLAMA_LOG_WARN("%s: failed to fit the batch in the KV cache, batch size = %d\n", __func__, (int) n_tokens_all);
+            return 1;
+        }
+
+        // we failed to fit the sbatch once, and now we will try to defrag the KV cache and try to fit it again
+        retry = false;
+
+        kv_self->restore();
+        kv_self->defrag_sched(-1.0f);
+
+        kv_self_update();
+
+        ubatches.clear();
+    }
+
+    // we now have prepared the ubatches for this llama_decode and are ready to start processing
+
     int64_t n_outputs_prev = 0;
 
-    while (sbatch.n_tokens > 0) {
-        llama_ubatch ubatch = kv_self->ubatch_next(sbatch, cparams.n_ubatch, embd_pooled);
-
+    for (const auto & ubatch : ubatches) {
         // count the outputs in this u_batch
         {
             int32_t n_outputs_new = 0;
@@ -943,13 +987,6 @@ int llama_context::decode(llama_batch & inp_batch) {
 
             // needs to happen before the graph is built
             n_outputs = n_outputs_new;
-        }
-
-        // find KV slot
-        if (!kv_self->find_slot(ubatch)) {
-            LLAMA_LOG_WARN("%s: failed to find KV cache slot for ubatch of size %d\n", __func__, ubatch.n_tokens);
-
-            return 1;
         }
 
         ggml_backend_sched_reset(sched.get());
