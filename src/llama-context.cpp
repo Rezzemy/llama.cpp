@@ -93,6 +93,7 @@ llama_context::llama_context(
     }
 
     cparams.n_ubatch = std::min(cparams.n_batch, params.n_ubatch == 0 ? params.n_batch : params.n_ubatch);
+
     cparams.op_offload = params.op_offload;
 
     const uint32_t n_ctx_per_seq = cparams.n_ctx / cparams.n_seq_max;
@@ -916,6 +917,9 @@ int llama_context::decode(llama_batch & inp_batch) {
         return -2;
     };
 
+    // =============================================================================================================
+    // TODO: refactor the llama_kv_cache interface and simplify this
+
     // handle any pending defrags/shifts
     kv_self_update();
 
@@ -967,11 +971,16 @@ int llama_context::decode(llama_batch & inp_batch) {
         ubatches.clear();
     }
 
+    // =============================================================================================================
+
     // we now have prepared the ubatches for this llama_decode and are ready to start processing
 
     int64_t n_outputs_prev = 0;
 
-    for (const auto & ubatch : ubatches) {
+    for (int i = 0; i < (int) ubatches.size(); ++i) {
+        const auto & ubatch = ubatches[i];
+        kv_self->set_state(i);
+
         // count the outputs in this u_batch
         {
             int32_t n_outputs_new = 0;
